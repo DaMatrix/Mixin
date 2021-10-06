@@ -30,7 +30,10 @@ import java.lang.instrument.IllegalClassFormatException;
 import java.lang.instrument.Instrumentation;
 import java.security.ProtectionDomain;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -53,11 +56,50 @@ public class MixinAgent implements IHotSwap {
      * Class file transformer that re-transforms mixin's target classes if the
      * mixin has been redefined.
      */
-    class Transformer implements ClassFileTransformer {
+    class Transformer implements ClassFileTransformer, Runnable {
+        final Map<String, ClassDefinition> pendingDefinitions = new HashMap<>();
+        long lastUpdateTime = 0L;
+
+        {
+            Thread t = new Thread(this, "Mixin HotSwap Delegate Thread");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            t.start();
+        }
 
         @Override
-        public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain domain, byte[] classfileBuffer)
+        public void run() {
+            while (true) {
+                try {
+                    Thread.sleep(1000L);
+
+                    if (!this.pendingDefinitions.isEmpty()) {
+                        synchronized (this) {
+                            long curTime = System.nanoTime();
+                            long endTime = this.lastUpdateTime + TimeUnit.SECONDS.toNanos(5L);
+
+                            if (endTime < curTime) {
+                                ClassDefinition[] definitions = this.pendingDefinitions.values().toArray(new ClassDefinition[0]);
+                                this.pendingDefinitions.clear();
+                                MixinAgent.logger.info("reloading " + definitions.length + " mixins...");
+                                instrumentation.redefineClasses(definitions);
+                                MixinAgent.logger.info("reloaded " + definitions.length + " mixins.");
+                            } else {
+                                MixinAgent.logger.info("waiting to reload changed mixins (" + ((endTime - curTime) / (double) TimeUnit.SECONDS.toNanos(1L)) + "s remaining)");
+                            }
+                        }
+                    }
+                } catch (Throwable th) {
+                    MixinAgent.logger.error(th);
+                }
+            }
+        }
+
+        @Override
+        public synchronized byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain domain, byte[] classfileBuffer)
                 throws IllegalClassFormatException {
+            this.lastUpdateTime = System.nanoTime();
+
             if (classBeingRedefined == null) {
                 return null;
             }
@@ -118,7 +160,7 @@ public class MixinAgent implements IHotSwap {
                         return false;
                     }
                     targetBytecode = MixinAgent.this.classTransformer.transformClassBytes(null, targetName, targetBytecode);
-                    MixinAgent.instrumentation.redefineClasses(new ClassDefinition(targetClass, targetBytecode));
+                    this.pendingDefinitions.put(targetName, new ClassDefinition(targetClass, targetBytecode));
                 } catch (Throwable th) {
                     MixinAgent.logger.error("Error while re-transforming target class " + target, th);
                     return false;
